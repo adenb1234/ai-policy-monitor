@@ -197,40 +197,99 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
             f"{topic} compliance requirements AI search products industry response",
         ]
 
-    # Run Perplexity queries in parallel
+    # Run Perplexity searches + alternative data sources in parallel
+    from sources.courtlistener import get_court_data
+    from sources.polymarket import get_polymarket_data
+    from sources.congress import get_congressional_data
+
     raw_results = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(_call_perplexity, q): q for q in search_tasks}
-        for future in as_completed(futures):
-            query = futures[future]
+    court_data = {}
+    market_data = {}
+    congress_data = {}
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        # Perplexity searches
+        pplx_futures = {executor.submit(_call_perplexity, q): q for q in search_tasks}
+        # Alternative data sources (always run, report even if empty)
+        court_future = executor.submit(get_court_data, f"Perplexity AI {topic}")
+        market_future = executor.submit(get_polymarket_data, [
+            topic, "AI regulation", "AI copyright", "artificial intelligence law", "EU AI Act"
+        ])
+        congress_future = executor.submit(get_congressional_data, f"artificial intelligence {topic}")
+
+        for future in as_completed(pplx_futures):
+            query = pplx_futures[future]
             try:
                 result = future.result()
-                raw_results.append(
-                    {
-                        "query": query,
-                        "content": result["content"],
-                        "citations": result["citations"],
-                    }
-                )
+                raw_results.append({"query": query, "content": result["content"], "citations": result["citations"]})
+            except CreditsError:
+                raise
             except Exception as e:
-                # Log the failure but don't abort
-                raw_results.append(
-                    {"query": query, "content": f"[Search failed: {e}]", "citations": []}
-                )
+                raw_results.append({"query": query, "content": f"[Search failed: {e}]", "citations": []})
 
-    # Build context to structure
-    context_parts = [f"Topic: {topic}\n"]
+        try:
+            court_data = court_future.result()
+        except Exception as e:
+            court_data = {"cases": [], "total_found": 0, "error": str(e)}
+
+        try:
+            market_data = market_future.result()
+        except Exception as e:
+            market_data = {"markets": [], "total_found": 0, "error": str(e)}
+
+        try:
+            congress_data = congress_future.result()
+        except Exception as e:
+            congress_data = {"bills": [], "total_found": 0, "error": str(e)}
+
+    # Build context — always include all data sources, even if empty
+    context_parts = [f"Risk topic (Perplexity-specific): {topic}\n"]
     if follow_up_queries:
         context_parts.append(
             "Follow-up gaps from Analyst:\n"
             + "\n".join(f"- {q}" for q in follow_up_queries)
             + "\n"
         )
-    context_parts.append("Raw Perplexity search results:\n")
+
+    context_parts.append("=== PERPLEXITY SONAR SEARCH RESULTS ===")
     for r in raw_results:
         context_parts.append(f"--- Query: {r['query']} ---")
         context_parts.append(f"Content:\n{r['content'][:1800]}")
         context_parts.append(f"Citation URLs: {json.dumps(r['citations'])}\n")
+
+    context_parts.append("=== COURTLISTENER: FEDERAL COURT CASES ===")
+    cases = court_data.get("cases", [])
+    if cases:
+        context_parts.append(f"Found {court_data.get('total_found', 0)} total cases. Top results:")
+        for c in cases[:6]:
+            context_parts.append(f"- {c['case_name']} | {c['court']} | Filed: {c['date_filed']} | {c['docket_url']}")
+            if c.get("recent_filings"):
+                for f in c["recent_filings"][:2]:
+                    context_parts.append(f"  Recent filing ({f['date']}): {f['description'][:120]}")
+    else:
+        context_parts.append(f"No federal court cases found for this topic. (Checked CourtListener RECAP database.)")
+
+    context_parts.append("\n=== POLYMARKET: PREDICTION MARKETS ===")
+    markets = market_data.get("markets", [])
+    if markets:
+        context_parts.append(f"Found {len(markets)} relevant markets (>$5k volume):")
+        for m in markets[:5]:
+            prob = f"{m['probability']:.0%}" if m.get("probability") is not None else "N/A"
+            context_parts.append(f"- \"{m['question']}\" | Probability: {prob} | Volume: ${m['volume']:,.0f} | Ends: {m['end_date']}")
+            context_parts.append(f"  {m['url']}")
+    else:
+        context_parts.append("No relevant prediction markets found on Polymarket (searched: AI regulation, AI copyright, EU AI Act).")
+
+    context_parts.append("\n=== CONGRESS.GOV: LEGISLATION ===")
+    bills = congress_data.get("bills", [])
+    if bills:
+        context_parts.append(f"Found {congress_data.get('total_found', 0)} total bills. Top results:")
+        for b in bills[:5]:
+            context_parts.append(f"- {b['bill_number']} ({b['congress']}): {b['title'][:80]}")
+            context_parts.append(f"  Sponsor: {b['sponsor']} | Status: {b['status']} | Cosponsors: {b['cosponsor_count']}")
+            context_parts.append(f"  Latest action ({b['latest_action_date']}): {b['latest_action'][:100]}")
+    else:
+        context_parts.append("No relevant bills found on Congress.gov for this topic.")
 
     context = "\n".join(context_parts)
 
@@ -302,7 +361,7 @@ def run_analyst(research: dict, loop_count: int = 0) -> dict:
 
     response = _openai_call(
         model="gpt-4o",
-        max_tokens=3000,
+        max_tokens=4096,
         messages=[
             {"role": "system", "content": ANALYST_SYSTEM + extra},
             {
