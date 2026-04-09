@@ -2,7 +2,7 @@
 
 A multi-agent pipeline that researches a policy or regulatory topic relevant to Perplexity AI and produces a finished executive brief — automatically.
 
-**Live app:** [link TBD after deployment]
+**Live app:** https://ai-policy-monitor.onrender.com
 
 ---
 
