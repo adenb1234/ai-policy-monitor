@@ -21,6 +21,13 @@ load_dotenv()
 _openai_client: Optional[OpenAI] = None
 
 
+class CreditsError(Exception):
+    """Raised when an API call fails due to insufficient credits or quota."""
+    def __init__(self, provider: str):
+        self.provider = provider
+        super().__init__(f"Aden ran out of {provider} credits")
+
+
 def _get_openai():
     global _openai_client
     if _openai_client is None:
@@ -29,6 +36,19 @@ def _get_openai():
             raise ValueError("OPENAI_API_KEY environment variable not set.")
         _openai_client = OpenAI(api_key=key)
     return _openai_client
+
+
+def _openai_call(*args, **kwargs):
+    """Wrapper around openai client calls that converts credit errors to CreditsError."""
+    from openai import RateLimitError, APIStatusError
+    try:
+        return _get_openai().chat.completions.create(*args, **kwargs)
+    except RateLimitError:
+        raise CreditsError("OpenAI")
+    except APIStatusError as e:
+        if e.status_code in (402, 429) or "quota" in str(e).lower() or "billing" in str(e).lower():
+            raise CreditsError("OpenAI")
+        raise
 
 
 def _get_perplexity_key() -> str:
@@ -68,6 +88,8 @@ def _call_perplexity(query: str) -> dict:
         },
         timeout=45,
     )
+    if response.status_code in (402, 429):
+        raise CreditsError("Perplexity")
     response.raise_for_status()
     data = response.json()
     return {
@@ -102,11 +124,32 @@ def _parse_json(text: str) -> dict:
 
 
 # ============================================================
+# PERPLEXITY COMPANY CONTEXT (injected into all agents)
+# ============================================================
+
+PERPLEXITY_CONTEXT = """
+COMPANY CONTEXT — Perplexity AI:
+- Product: AI-powered answer engine / search product. Aggregates and synthesizes web content into direct answers with citations.
+- Business model: Freemium subscriptions (~$20/mo Pro), enterprise API, and an advertising product launched in 2024.
+- Web infrastructure: Indexes and scrapes the public web via its own crawler (PerplexityBot). Has a Publisher Program offering revenue sharing to incentivize opt-in.
+- Scale: ~100M monthly active users as of early 2025. Incorporated in Delaware, HQ San Francisco.
+- Active litigation (as of early 2026): Copyright suits filed by Dow Jones, NYT, Chicago Tribune, Encyclopaedia Britannica, and Amazon (alleging unauthorized scraping/reproduction of content). A 9th Circuit appeal from an Amazon case is pending.
+- Key legal exposure vectors:
+    1. Fair use / copyright: whether reproducing snippets or full answers from indexed content is fair use
+    2. Scraping / robots.txt: whether ignoring robots.txt creates legal liability
+    3. Publisher relations: regulatory pressure to mandate revenue sharing or licensing
+    4. AI transparency: EU AI Act and state laws may require disclosure of AI-generated content
+    5. Data privacy: GDPR, CCPA implications for user query data and training data
+- Competitive context: competes directly with Google Search, Bing/Copilot, ChatGPT Search. Google has resources for prolonged litigation that Perplexity does not.
+- Strategic vulnerability: unlike OpenAI or Google, Perplexity does not train its own foundation models — its differentiation is entirely in search/retrieval/UX, making IP and scraping law existentially important.
+"""
+
+# ============================================================
 # AGENT 1: RESEARCHER
 # ============================================================
 
 RESEARCHER_SYSTEM = """You are a policy research agent working for Perplexity AI, a US AI search company.
-
+""" + PERPLEXITY_CONTEXT + """
 Given raw search results from the Perplexity Sonar search engine, structure them into a clean research report.
 
 Output ONLY valid JSON — no preamble, no explanation, no markdown wrapper:
@@ -149,9 +192,9 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
         ]
     else:
         search_tasks = [
-            f"{topic} regulation legislation Congress EU law 2024 2025",
-            f"{topic} court cases litigation lawsuits AI companies copyright",
-            f"{topic} compliance requirements industry response AI companies Perplexity",
+            f"Perplexity AI {topic} regulation legislation risk 2024 2025",
+            f"{topic} court cases litigation AI search engines Perplexity",
+            f"{topic} compliance requirements AI search products industry response",
         ]
 
     # Run Perplexity queries in parallel
@@ -192,7 +235,7 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
     context = "\n".join(context_parts)
 
     client = _get_openai()
-    response = client.chat.completions.create(
+    response = _openai_call(
         model="gpt-4o-mini",
         max_tokens=4096,
         messages=[
@@ -213,6 +256,7 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
 
 ANALYST_SYSTEM = """You are a senior policy analyst at Perplexity AI, a US AI search company.
 You receive structured research findings and produce strategic policy analysis.
+""" + PERPLEXITY_CONTEXT + """
 
 Output ONLY valid JSON — no preamble, no explanation, no markdown wrapper:
 {
@@ -256,7 +300,7 @@ def run_analyst(research: dict, loop_count: int = 0) -> dict:
     if loop_count >= 1:
         extra = "\n\nIMPORTANT: Set follow_up_queries to [] — no further research rounds are permitted. Complete your analysis with available information."
 
-    response = client.chat.completions.create(
+    response = _openai_call(
         model="gpt-4o",
         max_tokens=3000,
         messages=[
@@ -277,6 +321,7 @@ def run_analyst(research: dict, loop_count: int = 0) -> dict:
 
 BRIEF_WRITER_SYSTEM = """You are a policy communications specialist at Perplexity AI.
 You write polished, one-page executive policy briefs for senior leadership.
+""" + PERPLEXITY_CONTEXT + """
 
 Writing rules:
 - No hedging or filler ("it is important to note that...", "it remains to be seen...")
@@ -357,7 +402,7 @@ AVAILABLE SOURCES (use the most relevant ones):
 
 Write the policy brief now. Use the threads to fill the Key Developments section. Use overall_assessment to anchor the Executive Summary. Make the Recommended Actions concrete and specific to Perplexity."""
 
-    response = client.chat.completions.create(
+    response = _openai_call(
         model="gpt-4o",
         max_tokens=2000,
         messages=[

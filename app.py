@@ -4,7 +4,7 @@ AI Policy Monitor — Streamlit web app
 
 import streamlit as st
 import json
-from agents import run_researcher, run_analyst, run_brief_writer
+from agents import run_researcher, run_analyst, run_brief_writer, CreditsError
 
 MAX_LOOPS = 2
 
@@ -17,26 +17,25 @@ st.set_page_config(
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## AI Policy Monitor")
+    st.markdown("## Perplexity Policy Intelligence")
     st.markdown(
-        "Multi-agent pipeline for policy research. "
-        "Built to demonstrate real-world AI policy work."
+        "Multi-agent pipeline for researching regulatory and legal risks to Perplexity AI."
     )
     st.markdown("---")
     st.markdown("### How it works")
     st.markdown(
         """
-1. **Researcher** queries [Perplexity Sonar](https://www.perplexity.ai/) across regulatory, litigation, and compliance angles
-2. **Analyst** (Claude) synthesizes findings into risk threads — may request follow-up research (max 2 rounds)
-3. **Brief Writer** (Claude) produces a polished executive brief
+1. **Researcher** queries Perplexity Sonar across regulatory, litigation, and compliance angles — with Perplexity's business model as context
+2. **Analyst** (GPT-4o) synthesizes findings into risk threads specific to Perplexity — may request follow-up research (max 2 rounds)
+3. **Brief Writer** (GPT-4o) produces a polished executive brief
         """
     )
     st.markdown("---")
-    st.markdown("### Demo topics")
+    st.markdown("### Example risks")
     demo_topics = [
-        "Copyright litigation exposure for AI search engines",
-        "State-level AI regulation affecting AI product companies",
-        "EU AI Act compliance for AI search products",
+        "Copyright litigation from news publishers",
+        "State-level AI transparency laws",
+        "EU AI Act compliance for search products",
     ]
     for t in demo_topics:
         if st.button(t, key=f"demo_{t}", use_container_width=True):
@@ -57,18 +56,18 @@ if "topic_value" not in st.session_state:
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.title("AI Policy Monitor")
+st.title("Perplexity Policy Intelligence")
 st.markdown(
-    "Enter a policy topic to get a finished executive brief — "
-    "researched, analyzed, and written by a three-agent pipeline."
+    "Describe a regulatory or legal risk to Perplexity. "
+    "The pipeline researches it, assesses the exposure, and produces a finished executive brief."
 )
 st.markdown("")
 
 # ── Input ─────────────────────────────────────────────────────────────────────
 topic = st.text_input(
-    "Research topic",
+    "Risk to research",
     value=st.session_state.topic_value,
-    placeholder="e.g. Copyright litigation exposure for AI search engines",
+    placeholder="e.g. Copyright litigation from news publishers",
     label_visibility="collapsed",
 )
 
@@ -152,16 +151,22 @@ if run_button and topic.strip():
                 "all_analysis_rounds": all_analysis_rounds,
             }
 
+        except CreditsError as e:
+            status.update(label="Out of credits", state="error", expanded=True)
+            error_msg = str(e)
+            st.session_state.credits_error = True
         except Exception as e:
             status.update(label="Analysis failed", state="error", expanded=True)
             error_msg = str(e)
+            st.session_state.credits_error = False
 
     if error_msg:
-        st.error(
-            "Something went wrong. Please check that your API keys are set and try again."
-        )
-        with st.expander("Error details"):
-            st.code(error_msg)
+        if st.session_state.get("credits_error"):
+            st.error(f"💳 {error_msg} — please top up at platform.openai.com or perplexity.ai and try again.")
+        else:
+            st.error("Something went wrong. Please check that your API keys are set and try again.")
+            with st.expander("Error details"):
+                st.code(error_msg)
 
 
 # ── Results display ───────────────────────────────────────────────────────────
