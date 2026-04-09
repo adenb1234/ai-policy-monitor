@@ -55,83 +55,71 @@ def _fetch_docket_entries(docket_id: int, limit: int = 5) -> list[dict]:
         return []
 
 
+def _search(query: str, page_size: int = 8) -> list[dict]:
+    """Run a single CourtListener RECAP search and return parsed results."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/search/",
+            params={"q": query, "type": "r", "order_by": "score desc", "page_size": page_size},
+            headers=_get_headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("results", [])
+    except requests.RequestException:
+        return []
+
+
+def _parse_result(result: dict, label: str) -> dict:
+    case_name = result.get("caseName") or result.get("case_name_full") or ""
+    docket_path = result.get("docket_absolute_url", "")
+    docket_id = result.get("docket_id")
+    case_entry = {
+        "case_name": case_name,
+        "court": result.get("court") or result.get("court_citation_string") or "",
+        "date_filed": result.get("dateFiled") or "",
+        "docket_url": f"{SITE_URL}{docket_path}" if docket_path else "",
+        "label": label,  # "Perplexity" or "Precedent"
+        "recent_filings": [],
+    }
+    is_perplexity = "perplexity" in case_name.lower()
+    if is_perplexity and docket_id:
+        case_entry["recent_filings"] = _fetch_docket_entries(docket_id)
+    return case_entry
+
+
 def get_court_data(topic: str) -> dict:
     """
-    Search CourtListener for federal RECAP cases related to *topic*.
-
-    For any Perplexity-specific cases found, also fetches recent docket entries
-    (requires COURTLISTENER_TOKEN in .env; silently skipped when absent).
+    Search CourtListener for two sets of cases:
+    1. Perplexity-specific cases for *topic*
+    2. Precedent-setting AI copyright cases (OpenAI, Getty, Thomson Reuters, etc.)
 
     Returns:
         {
-            "cases": [
-                {
-                    "case_name": str,
-                    "court": str,
-                    "date_filed": str,          # YYYY-MM-DD
-                    "docket_url": str,
-                    "snippet": str,
-                    "recent_filings": [...]      # only for Perplexity cases
-                }
-            ],
-            "query_used": str,
+            "perplexity_cases": [...],
+            "precedent_cases": [...],
             "total_found": int
         }
     """
-    url = f"{BASE_URL}/search/"
-    params = {
-        "q": topic,
-        "type": "r",          # RECAP = federal court filings
-        "order_by": "score desc",
-        "page_size": 10,
-    }
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    try:
-        resp = requests.get(url, params=params, headers=_get_headers(), timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
-        return {"cases": [], "query_used": topic, "total_found": 0, "error": str(exc)}
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        pplx_future = ex.submit(_search, f"Perplexity AI {topic}", 6)
+        precedent_future = ex.submit(_search, "OpenAI OR Getty OR Thomson Reuters copyright artificial intelligence", 6)
+        pplx_results = pplx_future.result()
+        precedent_results = precedent_future.result()
 
-    total = data.get("count", 0)
-    cases = []
+    # Deduplicate precedent results against Perplexity results
+    pplx_names = {r.get("caseName", "") for r in pplx_results}
+    precedent_results = [r for r in precedent_results if r.get("caseName", "") not in pplx_names]
 
-    for result in data.get("results", []):
-        case_name = result.get("caseName") or result.get("case_name_full") or ""
-        court = result.get("court") or result.get("court_citation_string") or ""
-        date_filed = result.get("dateFiled") or ""
-        docket_path = result.get("docket_absolute_url", "")
-        docket_url = f"{SITE_URL}{docket_path}" if docket_path else ""
-        docket_id = result.get("docket_id")
-
-        # Build a snippet from the first recap document description
-        snippet = ""
-        recap_docs = result.get("recap_documents", [])
-        if recap_docs:
-            snippet = recap_docs[0].get("description", "")
-
-        case_entry: dict = {
-            "case_name": case_name,
-            "court": court,
-            "date_filed": date_filed,
-            "docket_url": docket_url,
-            "snippet": snippet,
-        }
-
-        # Pull recent docket entries only for Perplexity-related cases
-        is_perplexity = "perplexity" in case_name.lower() or any(
-            "perplexity" in str(p).lower() for p in result.get("party", [])
-        )
-        if is_perplexity and docket_id:
-            filings = _fetch_docket_entries(docket_id)
-            case_entry["recent_filings"] = filings
-
-        cases.append(case_entry)
+    perplexity_cases = [_parse_result(r, "Perplexity") for r in pplx_results]
+    precedent_cases = [_parse_result(r, "Precedent") for r in precedent_results]
 
     return {
-        "cases": cases,
-        "query_used": topic,
-        "total_found": total,
+        "perplexity_cases": perplexity_cases,
+        "precedent_cases": precedent_cases,
+        "total_found": len(perplexity_cases) + len(precedent_cases),
     }
 
 

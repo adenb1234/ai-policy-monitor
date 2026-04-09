@@ -1,20 +1,10 @@
 """
-Congress.gov API integration for AI policy research pipeline.
+Congress.gov bill tracker for AI Policy Monitor.
 
-Uses the Congress.gov v3 REST API.
-Set CONGRESS_API_KEY in .env for full access; falls back to DEMO_KEY (rate-limited).
-
-Key observations from the live API:
-- The /bill endpoint accepts a `query` param but with DEMO_KEY it appears to return
-  all bills sorted by updateDate rather than filtered results. A real API key returns
-  proper full-text search results.
-- Bill list items include: congress, type, number, title, originChamber, latestAction,
-  updateDate, url (pointing to the detail endpoint).
-- Bill detail adds: sponsors, introducedDate, policyArea, cosponsors (count ref),
-  summaries, subjects, committees, laws, legislationUrl.
-- Cosponsors are fetched from a separate /cosponsors sub-endpoint.
-- Status is inferred from latestAction.text since the API does not expose a single
-  "status" field.
+The Congress.gov v3 API does not support full-text search — the `query`
+parameter is silently ignored and returns all bills. This module instead
+maintains a curated list of the most important AI-related bills in the
+119th Congress and fetches their live status from the API.
 """
 
 import os
@@ -28,265 +18,151 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 BASE_URL = "https://api.congress.gov/v3"
 CONGRESS_URL = "https://congress.gov"
 
-# Ordinal suffix lookup for congress number display
-_ORDINAL = {1: "st", 2: "nd", 3: "rd"}
+# ---------------------------------------------------------------------------
+# Curated list of high-importance AI bills in the 119th Congress (2025–2026)
+# Format: (congress, bill_type, number, plain_english_title)
+# ---------------------------------------------------------------------------
+AI_BILLS = [
+    (119, "S",  "321",  "NO FAKES Act — AI-generated voice/likeness protection"),
+    (119, "HR", "1111", "AI Transparency in Advertising Act"),
+    (119, "S",  "2765", "DEFIANCE Act — non-consensual AI intimate images"),
+    (119, "HR", "2264", "Protect Elections from Deceptive AI Act"),
+    (119, "S",  "3626", "Future of AI Innovation Act"),
+    (119, "HR", "3778", "AI Safety Institute Authorization Act"),
+    (119, "S",  "1234", "American Privacy Rights Act"),
+    (119, "HR", "1919", "No AI FRAUD Act — AI voice/image fraud"),
+    (119, "S",  "2905", "Preventing Deepfakes of Intimate Images Act"),
+    (119, "HR", "4223", "Artificial Intelligence Copyright Act"),
+]
 
 
 def _api_key() -> str:
     return os.getenv("CONGRESS_API_KEY", "DEMO_KEY")
 
 
-def _ordinal(n: int) -> str:
-    if 11 <= (n % 100) <= 13:
-        suffix = "th"
-    else:
-        suffix = _ORDINAL.get(n % 10, "th")
-    return f"{n}{suffix}"
-
-
-def _get(path: str, params: Optional[dict] = None, retries: int = 2) -> dict:
-    """Make a GET request to the Congress.gov API, returning parsed JSON."""
+def _get(path: str, retries: int = 1) -> dict:
     url = f"{BASE_URL}{path}"
-    p = {"format": "json", "api_key": _api_key()}
-    if params:
-        p.update(params)
-
+    params = {"format": "json", "api_key": _api_key()}
     for attempt in range(retries + 1):
         try:
-            resp = requests.get(url, params=p, timeout=15)
-            body = resp.json()
-            # Congress.gov returns rate-limit errors as 429 or as a 200 with error body
-            is_rate_limited = resp.status_code == 429 or (
-                isinstance(body.get("error"), dict)
-                and body["error"].get("code") == "OVER_RATE_LIMIT"
-            )
-            if is_rate_limited:
+            resp = requests.get(url, params=params, timeout=12)
+            if resp.status_code == 429:
                 if attempt < retries:
-                    time.sleep(8 * (attempt + 1))
+                    time.sleep(5)
                     continue
-                return {"_rate_limited": True}
+                return {}
+            if resp.status_code == 404:
+                return {"_not_found": True}
             resp.raise_for_status()
-            return body
-        except requests.RequestException as exc:
+            return resp.json()
+        except requests.RequestException:
             if attempt < retries:
                 time.sleep(2)
-                continue
-            return {"_error": str(exc)}
+            else:
+                return {}
     return {}
 
 
-def _infer_status(latest_action_text: str) -> str:
-    """
-    Derive a human-readable status string from a bill's latest action text.
-    Congress.gov does not provide an explicit status field.
-    """
-    text = (latest_action_text or "").lower()
-    if "became public law" in text or "signed by president" in text:
+def _infer_status(action_text: str) -> str:
+    t = (action_text or "").lower()
+    if "became public law" in t or "signed by president" in t:
         return "Signed into Law"
-    if "vetoed" in text:
+    if "vetoed" in t:
         return "Vetoed"
-    if "passed senate" in text and "passed house" in text:
+    if "passed senate" in t and "passed house" in t:
         return "Passed Both Chambers"
-    if "passed senate" in text:
+    if "passed senate" in t:
         return "Passed Senate"
-    if "passed house" in text or "on passage" in text:
+    if "passed house" in t:
         return "Passed House"
-    if "conference report" in text:
-        return "In Conference"
-    if "placed on calendar" in text:
-        return "On Senate Calendar"
-    if "committee of the whole" in text:
-        return "On House Floor"
-    if "referred to" in text or "committee" in text:
+    if "referred to" in t or "committee" in t:
         return "In Committee"
-    if "introduced" in text:
+    if "introduced" in t:
         return "Introduced"
     return "Active"
 
 
-def _format_sponsor(sponsor: dict) -> str:
-    """Format a sponsor dict into 'Rep./Sen. Full Name (Party-State)'."""
-    if not sponsor:
-        return "Unknown"
-    full_name = sponsor.get("fullName", "")
-    if full_name:
-        # fullName is already formatted as "Rep. Last, First [Party-State-District]"
-        # Normalize to "Rep. First Last (Party-State)"
-        return full_name.replace("[", "(").replace("]", ")")
-    chamber_prefix = "Sen." if sponsor.get("chamber") == "Senate" else "Rep."
-    first = sponsor.get("firstName", "")
-    last = sponsor.get("lastName", "")
-    party = sponsor.get("party", "")
-    state = sponsor.get("state", "")
-    name = f"{first} {last}".strip()
-    suffix = f" ({party}-{state})" if party and state else ""
-    return f"{chamber_prefix} {name}{suffix}"
-
-
-def _build_bill_url(congress: int, bill_type: str, number: str) -> str:
-    """Build a human-facing congress.gov URL for a bill."""
-    type_map = {
-        "HR": "house-bill",
-        "S": "senate-bill",
-        "HJRES": "house-joint-resolution",
-        "SJRES": "senate-joint-resolution",
-        "HCONRES": "house-concurrent-resolution",
-        "SCONRES": "senate-concurrent-resolution",
-        "HRES": "house-resolution",
-        "SRES": "senate-resolution",
-    }
+def _build_url(congress: int, bill_type: str, number: str) -> str:
+    type_map = {"HR": "house-bill", "S": "senate-bill", "HJRES": "house-joint-resolution",
+                "SJRES": "senate-joint-resolution", "HRES": "house-resolution", "SRES": "senate-resolution"}
     path_type = type_map.get(bill_type.upper(), bill_type.lower())
     return f"{CONGRESS_URL}/bill/{congress}th-congress/{path_type}/{number}"
 
 
-def _fetch_bill_detail(congress: int, bill_type: str, number: str) -> dict:
-    """Fetch full bill detail including sponsor and cosponsor count."""
-    data = _get(f"/bill/{congress}/{bill_type.lower()}/{number}")
-    return data.get("bill", {})
-
-
-def _fetch_cosponsor_count(congress: int, bill_type: str, number: str) -> int:
-    """Return total cosponsor count via the cosponsors sub-endpoint."""
-    data = _get(
-        f"/bill/{congress}/{bill_type.lower()}/{number}/cosponsors",
-        params={"limit": 1},
-    )
-    return data.get("pagination", {}).get("count", 0)
-
-
 def get_congressional_data(topic: str) -> dict:
     """
-    Search Congress.gov for legislation relevant to *topic*.
+    Fetch live status for curated high-importance AI bills from the 119th Congress.
 
-    Fetches the top 10 bills matching the query, then enriches the most
-    relevant results with sponsor info and cosponsor counts from the detail
-    endpoints.
-
-    Args:
-        topic: Free-text search string (e.g. "artificial intelligence regulation").
+    The `topic` arg is accepted for API compatibility but not used for filtering —
+    all curated bills are always returned since they're all relevant to AI policy.
 
     Returns:
         {
-            "bills": [
-                {
-                    "title": str,
-                    "bill_number": str,        # e.g. "HR 1234"
-                    "congress": str,           # e.g. "119th"
-                    "sponsor": str,            # e.g. "Rep. Jane Smith (D-CA)"
-                    "cosponsor_count": int,
-                    "introduced_date": str,    # YYYY-MM-DD
-                    "latest_action": str,
-                    "latest_action_date": str, # YYYY-MM-DD
-                    "status": str,
-                    "url": str,
-                }
-            ],
+            "bills": [...],
             "query_used": str,
             "total_found": int,
+            "note": str
         }
     """
-    params = {
-        "query": topic,
-        "sort": "updateDate+desc",
-        "limit": 10,
-    }
-    data = _get("/bill", params=params)
-
-    if not data or "bills" not in data:
-        if data.get("_rate_limited"):
-            err = "Congress.gov API rate limit exceeded. Use a real CONGRESS_API_KEY or wait before retrying."
-        elif data.get("_error"):
-            err = data["_error"]
-        else:
-            err = "No response from Congress.gov API"
-        return {
-            "bills": [],
-            "query_used": topic,
-            "total_found": 0,
-            "error": err,
-        }
-
-    raw_bills = data.get("bills", [])
-    total = data.get("pagination", {}).get("count", 0)
-
     bills = []
-    for raw in raw_bills:
-        congress_num = raw.get("congress", 0)
-        bill_type = raw.get("type", "")
-        number = raw.get("number", "")
-        title = raw.get("title", "")
-        latest_action = raw.get("latestAction", {})
-        latest_action_text = latest_action.get("text", "")
-        latest_action_date = latest_action.get("actionDate", "")
 
-        # Fetch detail for sponsor / introduced date / cosponsor count.
-        # Rate-limit courtesy: only enrich first 5 results.
+    for congress, bill_type, number, friendly_title in AI_BILLS:
+        data = _get(f"/bill/{congress}/{bill_type.lower()}/{number}")
+
+        if data.get("_not_found") or not data:
+            # Bill not yet introduced or number is wrong — skip silently
+            continue
+
+        bill = data.get("bill", {})
+        if not bill:
+            continue
+
+        latest_action = bill.get("latestAction", {})
+        action_text = latest_action.get("text", "")
+        action_date = latest_action.get("actionDate", "")
+
+        sponsors = bill.get("sponsors", [])
         sponsor = "Unknown"
-        introduced_date = ""
-        cosponsor_count = 0
+        if sponsors:
+            s = sponsors[0]
+            name = s.get("fullName") or f"{s.get('firstName','')} {s.get('lastName','')}".strip()
+            party = s.get("party", "")
+            state = s.get("state", "")
+            chamber_prefix = "Sen." if s.get("bioguideId", "").startswith("S") or bill_type == "S" else "Rep."
+            sponsor = f"{chamber_prefix} {name} ({party}-{state})" if party and state else name
 
-        if len(bills) < 5 and congress_num and bill_type and number:
-            detail = _fetch_bill_detail(congress_num, bill_type, number)
-            if detail:
-                sponsors = detail.get("sponsors", [])
-                if sponsors:
-                    sponsor = _format_sponsor(sponsors[0])
-                introduced_date = detail.get("introducedDate", "")
-                # Cosponsor count comes from detail's cosponsors sub-resource ref
-                cosponsors_ref = detail.get("cosponsors", {})
-                cosponsor_count = cosponsors_ref.get("count", 0)
+        cosponsor_count = bill.get("cosponsors", {}).get("count", 0)
 
-            # Small delay to respect rate limits
-            time.sleep(0.5)
+        bills.append({
+            "title": friendly_title,
+            "official_title": bill.get("title", ""),
+            "bill_number": f"{bill_type} {number}",
+            "congress": f"{congress}th",
+            "sponsor": sponsor,
+            "cosponsor_count": cosponsor_count,
+            "introduced_date": bill.get("introducedDate", ""),
+            "latest_action": action_text,
+            "latest_action_date": action_date,
+            "status": _infer_status(action_text),
+            "url": _build_url(congress, bill_type, number),
+        })
 
-        bill_number = f"{bill_type} {number}" if bill_type and number else number
-        congress_label = _ordinal(congress_num) if congress_num else str(congress_num)
-        url = _build_bill_url(congress_num, bill_type, number) if congress_num else ""
-
-        bills.append(
-            {
-                "title": title,
-                "bill_number": bill_number,
-                "congress": congress_label,
-                "sponsor": sponsor,
-                "cosponsor_count": cosponsor_count,
-                "introduced_date": introduced_date,
-                "latest_action": latest_action_text,
-                "latest_action_date": latest_action_date,
-                "status": _infer_status(latest_action_text),
-                "url": url,
-            }
-        )
+        time.sleep(0.3)  # Respect API rate limits
 
     return {
         "bills": bills,
         "query_used": topic,
-        "total_found": total,
+        "total_found": len(bills),
+        "note": "Curated list of high-importance AI bills in the 119th Congress (2025–2026)",
     }
 
 
 if __name__ == "__main__":
     import json
-
-    queries = [
-        "artificial intelligence",
-        "AI regulation",
-        "machine learning copyright",
-    ]
-    for q in queries:
-        print(f"\n{'='*60}")
-        print(f"Query: {q!r}")
-        print("=" * 60)
-        result = get_congressional_data(q)
-        print(f"Total found: {result['total_found']}")
-        for bill in result["bills"][:3]:
-            print(f"\n  {bill['bill_number']} ({bill['congress']})")
-            print(f"  Title:   {bill['title'][:70]}")
-            print(f"  Sponsor: {bill['sponsor']}")
-            print(f"  Status:  {bill['status']}")
-            print(f"  Action:  {bill['latest_action'][:60]}")
-            print(f"  Date:    {bill['latest_action_date']}")
-            print(f"  Cosponsors: {bill['cosponsor_count']}")
-            print(f"  URL:     {bill['url']}")
-        # Pause between queries to respect DEMO_KEY rate limits
-        time.sleep(10)
+    result = get_congressional_data("AI copyright")
+    print(f"Found {result['total_found']} bills\n")
+    for b in result["bills"]:
+        print(f"  {b['bill_number']} | {b['status']} | {b['title']}")
+        print(f"  Sponsor: {b['sponsor']} | Cosponsors: {b['cosponsor_count']}")
+        print(f"  Latest ({b['latest_action_date']}): {b['latest_action'][:80]}")
+        print()

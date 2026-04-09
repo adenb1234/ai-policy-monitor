@@ -199,23 +199,18 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
 
     # Run Perplexity searches + alternative data sources in parallel
     from sources.courtlistener import get_court_data
-    from sources.polymarket import get_polymarket_data
     from sources.congress import get_congressional_data
 
     raw_results = []
     court_data = {}
-    market_data = {}
     congress_data = {}
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         # Perplexity searches
         pplx_futures = {executor.submit(_call_perplexity, q): q for q in search_tasks}
         # Alternative data sources (always run, report even if empty)
-        court_future = executor.submit(get_court_data, f"Perplexity AI {topic}")
-        market_future = executor.submit(get_polymarket_data, [
-            topic, "AI regulation", "AI copyright", "artificial intelligence law", "EU AI Act"
-        ])
-        congress_future = executor.submit(get_congressional_data, f"artificial intelligence {topic}")
+        court_future = executor.submit(get_court_data, topic)
+        congress_future = executor.submit(get_congressional_data, topic)
 
         for future in as_completed(pplx_futures):
             query = pplx_futures[future]
@@ -231,11 +226,6 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
             court_data = court_future.result()
         except Exception as e:
             court_data = {"cases": [], "total_found": 0, "error": str(e)}
-
-        try:
-            market_data = market_future.result()
-        except Exception as e:
-            market_data = {"markets": [], "total_found": 0, "error": str(e)}
 
         try:
             congress_data = congress_future.result()
@@ -257,28 +247,25 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
         context_parts.append(f"Content:\n{r['content'][:1800]}")
         context_parts.append(f"Citation URLs: {json.dumps(r['citations'])}\n")
 
-    context_parts.append("=== COURTLISTENER: FEDERAL COURT CASES ===")
-    cases = court_data.get("cases", [])
-    if cases:
-        context_parts.append(f"Found {court_data.get('total_found', 0)} total cases. Top results:")
-        for c in cases[:6]:
+    context_parts.append("=== COURTLISTENER: PERPLEXITY-SPECIFIC CASES ===")
+    pplx_cases = court_data.get("perplexity_cases", [])
+    if pplx_cases:
+        context_parts.append(f"Active cases directly naming Perplexity AI:")
+        for c in pplx_cases[:6]:
             context_parts.append(f"- {c['case_name']} | {c['court']} | Filed: {c['date_filed']} | {c['docket_url']}")
-            if c.get("recent_filings"):
-                for f in c["recent_filings"][:2]:
-                    context_parts.append(f"  Recent filing ({f['date']}): {f['description'][:120]}")
+            for f in c.get("recent_filings", [])[:2]:
+                context_parts.append(f"  Recent filing ({f['date']}): {f['description'][:120]}")
     else:
-        context_parts.append(f"No federal court cases found for this topic. (Checked CourtListener RECAP database.)")
+        context_parts.append("No federal cases directly naming Perplexity found for this topic.")
 
-    context_parts.append("\n=== POLYMARKET: PREDICTION MARKETS ===")
-    markets = market_data.get("markets", [])
-    if markets:
-        context_parts.append(f"Found {len(markets)} relevant markets (>$5k volume):")
-        for m in markets[:5]:
-            prob = f"{m['probability']:.0%}" if m.get("probability") is not None else "N/A"
-            context_parts.append(f"- \"{m['question']}\" | Probability: {prob} | Volume: ${m['volume']:,.0f} | Ends: {m['end_date']}")
-            context_parts.append(f"  {m['url']}")
+    context_parts.append("\n=== COURTLISTENER: PRECEDENT-SETTING AI COPYRIGHT CASES ===")
+    precedent_cases = court_data.get("precedent_cases", [])
+    if precedent_cases:
+        context_parts.append("Key cases setting legal precedent for AI copyright (OpenAI, Getty, Thomson Reuters):")
+        for c in precedent_cases[:6]:
+            context_parts.append(f"- {c['case_name']} | {c['court']} | Filed: {c['date_filed']} | {c['docket_url']}")
     else:
-        context_parts.append("No relevant prediction markets found on Polymarket (searched: AI regulation, AI copyright, EU AI Act).")
+        context_parts.append("No major AI copyright precedent cases found.")
 
     context_parts.append("\n=== CONGRESS.GOV: LEGISLATION ===")
     bills = congress_data.get("bills", [])
