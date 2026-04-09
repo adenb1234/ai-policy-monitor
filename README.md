@@ -11,7 +11,7 @@ A multi-agent pipeline that researches a policy or regulatory topic relevant to 
 Enter a topic like *"Copyright litigation exposure for AI search engines"* and the pipeline:
 
 1. **Researches** it — three parallel Perplexity Sonar queries covering regulatory, litigation, and compliance angles
-2. **Analyzes** the findings — Claude identifies key risk threads, flags gaps, and may request follow-up research (up to 2 rounds)
+2. **Analyzes** the findings — GPT-4o identifies key risk threads, flags gaps, and may request follow-up research (up to 2 rounds)
 3. **Writes** a polished one-page executive brief — with risk table, recommended actions, and citations
 
 The whole thing takes about 60–90 seconds.
@@ -65,8 +65,8 @@ User input (topic string)
 | Component | Technology |
 |-----------|-----------|
 | Search | Perplexity Sonar API (`sonar` model) |
-| Analysis & Writing | Anthropic Claude (`claude-sonnet-4-6`) |
-| Query structuring | Anthropic Claude (`claude-haiku-4-5`) |
+| Analysis & Writing | OpenAI (`gpt-4o`) |
+| Query structuring | OpenAI (`gpt-4o-mini`) |
 | Web app | Streamlit |
 | Deployment | Render |
 
@@ -84,6 +84,7 @@ User input (topic string)
 
 ```bash
 git clone https://github.com/adenb1234/ai-policy-monitor
+
 cd ai-policy-monitor
 
 pip install -r requirements.txt
@@ -97,7 +98,7 @@ streamlit run app.py
 **Required environment variables:**
 
 ```
-ANTHROPIC_API_KEY=...
+OPENAI_API_KEY=...
 PERPLEXITY_API_KEY=...
 ```
 

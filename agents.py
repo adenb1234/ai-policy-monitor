@@ -3,33 +3,32 @@ AI Policy Monitor — Agent implementations
 
 Three agents:
 1. Researcher: Uses Perplexity Sonar API to search for policy/regulatory developments
-2. Analyst: Uses Claude to synthesize findings and identify gaps (may request follow-up)
-3. Brief Writer: Uses Claude to produce a polished executive policy brief
+2. Analyst: Uses GPT-4o to synthesize findings and identify gaps (may request follow-up)
+3. Brief Writer: Uses GPT-4o to produce a polished executive policy brief
 """
 
 import os
 import json
 import re
-import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
-import anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-_anthropic_client: Optional[anthropic.Anthropic] = None
+_openai_client: Optional[OpenAI] = None
 
 
-def _get_anthropic():
-    global _anthropic_client
-    if _anthropic_client is None:
-        key = os.getenv("ANTHROPIC_API_KEY")
+def _get_openai():
+    global _openai_client
+    if _openai_client is None:
+        key = os.getenv("OPENAI_API_KEY")
         if not key:
-            raise ValueError("ANTHROPIC_API_KEY environment variable not set.")
-        _anthropic_client = anthropic.Anthropic(api_key=key)
-    return _anthropic_client
+            raise ValueError("OPENAI_API_KEY environment variable not set.")
+        _openai_client = OpenAI(api_key=key)
+    return _openai_client
 
 
 def _get_perplexity_key() -> str:
@@ -144,8 +143,6 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
     Returns:
         Structured research findings dict
     """
-    client = _get_anthropic()
-
     if follow_up_queries:
         search_tasks = [
             f"{topic} {q} 2024 2025 regulation law" for q in follow_up_queries[:3]
@@ -178,7 +175,7 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
                     {"query": query, "content": f"[Search failed: {e}]", "citations": []}
                 )
 
-    # Build context for Claude to structure
+    # Build context to structure
     context_parts = [f"Topic: {topic}\n"]
     if follow_up_queries:
         context_parts.append(
@@ -194,19 +191,20 @@ def run_researcher(topic: str, follow_up_queries: Optional[list] = None) -> dict
 
     context = "\n".join(context_parts)
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+    client = _get_openai()
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
         max_tokens=4096,
-        system=RESEARCHER_SYSTEM,
         messages=[
+            {"role": "system", "content": RESEARCHER_SYSTEM},
             {
                 "role": "user",
                 "content": f"Structure these search results into the required JSON format:\n\n{context}",
-            }
+            },
         ],
     )
 
-    return _parse_json(response.content[0].text)
+    return _parse_json(response.choices[0].message.content)
 
 
 # ============================================================
@@ -252,25 +250,25 @@ def run_analyst(research: dict, loop_count: int = 0) -> dict:
     Returns:
         Structured analysis dict (may contain follow_up_queries)
     """
-    client = _get_anthropic()
+    client = _get_openai()
 
     extra = ""
     if loop_count >= 1:
         extra = "\n\nIMPORTANT: Set follow_up_queries to [] — no further research rounds are permitted. Complete your analysis with available information."
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
+    response = client.chat.completions.create(
+        model="gpt-4o",
         max_tokens=3000,
-        system=ANALYST_SYSTEM + extra,
         messages=[
+            {"role": "system", "content": ANALYST_SYSTEM + extra},
             {
                 "role": "user",
                 "content": f"Analyze these research findings:\n\n{json.dumps(research, indent=2)}",
-            }
+            },
         ],
     )
 
-    return _parse_json(response.content[0].text)
+    return _parse_json(response.choices[0].message.content)
 
 
 # ============================================================
@@ -332,7 +330,7 @@ def run_brief_writer(analysis: dict, research: dict) -> str:
     """
     from datetime import date
 
-    client = _get_anthropic()
+    client = _get_openai()
     today = date.today().strftime("%B %d, %Y")
 
     # Compile unique sources
@@ -359,11 +357,13 @@ AVAILABLE SOURCES (use the most relevant ones):
 
 Write the policy brief now. Use the threads to fill the Key Developments section. Use overall_assessment to anchor the Executive Summary. Make the Recommended Actions concrete and specific to Perplexity."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
+    response = client.chat.completions.create(
+        model="gpt-4o",
         max_tokens=2000,
-        system=BRIEF_WRITER_SYSTEM,
-        messages=[{"role": "user", "content": context}],
+        messages=[
+            {"role": "system", "content": BRIEF_WRITER_SYSTEM},
+            {"role": "user", "content": context},
+        ],
     )
 
-    return response.content[0].text
+    return response.choices[0].message.content
